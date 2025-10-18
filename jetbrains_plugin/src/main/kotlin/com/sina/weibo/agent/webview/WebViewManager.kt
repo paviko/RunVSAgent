@@ -244,17 +244,25 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
             logger.error("Cannot get RPC protocol instance, cannot register WebView provider: ${data.viewType}")
             return
         }
-        // When registration event is notified, create a new WebView instance
+        // When registration event is notified, create a new WebView instance on the EDT to avoid JCEF issues
         val viewId = UUID.randomUUID().toString()
 
         val title = data.options["title"] as? String ?: data.viewType
         val state = data.options["state"] as? Map<String, Any?> ?: emptyMap()
         
-        val webview = WebViewInstance(data.viewType, viewId, title, state,project,data.extension)
+        var webview: WebViewInstance? = null
+        val app = ApplicationManager.getApplication()
+        val createRunnable = Runnable {
+            webview = WebViewInstance(data.viewType, viewId, title, state, project, data.extension)
+        }
+        if (app.isDispatchThread) {
+            createRunnable.run()
+        } else {
+            app.invokeAndWait(createRunnable)
+        }
 
         val proxy = protocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
         proxy.resolveWebviewView(viewId, data.viewType, title, state, null)
-
 
         // Set as the latest created WebView
         latestWebView = webview
@@ -262,7 +270,7 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         logger.info("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
 
         // Notify callback
-        notifyWebViewCreated(webview)
+        webview?.let { notifyWebViewCreated(it) }
     }
     
     /**
@@ -278,11 +286,12 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
          */
     fun updateWebViewHtml(data: WebviewHtmlUpdateData) {
         val encodedState = getLatestWebView()?.state.toString().replace("\"", "\\\"")
-        // Support both <script nonce="..."> and <script type="text/javascript" nonce="..."> formats
-        val mRst = """<script(?:\s+type="text/javascript")?\s+nonce="([A-Za-z0-9]{32})">""".toRegex().find(data.htmlContent)
-        val str = mRst?.value ?: ""
-        data.htmlContent = data.htmlContent.replace(str,"""
-                        ${str}
+        // Try to find an existing <script> tag with a nonce to safely inject into (covers any attribute order)
+        val nonceScriptRegex = """<script\\b[^>]*\\snonce=\"([^\"]+)\"[^>]*>""".toRegex()
+        val mRst = nonceScriptRegex.find(data.htmlContent)
+
+        // The JS bridge to inject (without wrapping <script> tag)
+        val injectionCode = """
                         // First define the function to send messages
                         window.sendMessageToPlugin = function(message) {
                             // Convert JS object to JSON string
@@ -337,7 +346,30 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
                         delete window.frameElement;
                         
                         console.log("VSCode API mock injected");
-                        """)
+                        """
+
+        if (mRst != null) {
+            val openTag = mRst.value
+            data.htmlContent = data.htmlContent.replace(openTag, """
+                        ${openTag}
+                        ${injectionCode}
+                        """.trimIndent())
+        } else {
+            // Fallback: no nonce-bearing script tag found. Inject our bridge inside a new script tag.
+            // This avoids corrupting the HTML by replacing an empty string and covers pages without CSP/nonce.
+            val scriptTag = """
+                        <script>
+                        ${injectionCode}
+                        </script>
+                        """.trimIndent()
+            data.htmlContent = when {
+                data.htmlContent.contains("</head>", ignoreCase = true) ->
+                    data.htmlContent.replaceFirst(Regex("(?i)</head>"), scriptTag + "\n</head>")
+                Regex("(?i)<body[^>]*>").containsMatchIn(data.htmlContent) ->
+                    data.htmlContent.replaceFirst(Regex("(?i)<body[^>]*>"), "$0\n$scriptTag\n")
+                else -> scriptTag + "\n" + data.htmlContent
+            }
+        }
 
 
 
@@ -887,7 +919,9 @@ class WebViewInstance(
     fun loadUrl(url: String) {
         if (!isDisposed) {
             logger.info("WebView loading URL: $url")
-            browser.loadURL(url)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable { browser.loadURL(url) }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
@@ -897,11 +931,15 @@ class WebViewInstance(
     fun loadHtml(html: String, baseUrl: String? = null) {
         if (!isDisposed) {
             logger.info("WebView loading HTML content, length: ${html.length}, baseUrl: $baseUrl")
-            if(baseUrl != null) {
-                browser.loadHTML(html, baseUrl)
-            }else {
-                browser.loadHTML(html)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable {
+                if(baseUrl != null) {
+                    browser.loadHTML(html, baseUrl)
+                } else {
+                    browser.loadHTML(html)
+                }
             }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
@@ -911,7 +949,9 @@ class WebViewInstance(
     fun executeJavaScript(script: String) {
         if (!isDisposed) {
             logger.debug("WebView executing JavaScript, script length: ${script.length}")
-            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable { browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0) }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
