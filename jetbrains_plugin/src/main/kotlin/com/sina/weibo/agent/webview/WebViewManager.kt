@@ -244,17 +244,25 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
             logger.error("Cannot get RPC protocol instance, cannot register WebView provider: ${data.viewType}")
             return
         }
-        // When registration event is notified, create a new WebView instance
+        // When registration event is notified, create a new WebView instance on the EDT to avoid JCEF issues
         val viewId = UUID.randomUUID().toString()
 
         val title = data.options["title"] as? String ?: data.viewType
         val state = data.options["state"] as? Map<String, Any?> ?: emptyMap()
         
-        val webview = WebViewInstance(data.viewType, viewId, title, state,project,data.extension)
+        var webview: WebViewInstance? = null
+        val app = ApplicationManager.getApplication()
+        val createRunnable = Runnable {
+            webview = WebViewInstance(data.viewType, viewId, title, state, project, data.extension)
+        }
+        if (app.isDispatchThread) {
+            createRunnable.run()
+        } else {
+            app.invokeAndWait(createRunnable)
+        }
 
         val proxy = protocol.getProxy(ServiceProxyRegistry.ExtHostContext.ExtHostWebviewViews)
         proxy.resolveWebviewView(viewId, data.viewType, title, state, null)
-
 
         // Set as the latest created WebView
         latestWebView = webview
@@ -262,7 +270,7 @@ class WebViewManager(var project: Project) : Disposable, ThemeChangeListener {
         logger.info("Create WebView instance: viewType=${data.viewType}, viewId=$viewId")
 
         // Notify callback
-        notifyWebViewCreated(webview)
+        webview?.let { notifyWebViewCreated(it) }
     }
     
     /**
@@ -911,7 +919,9 @@ class WebViewInstance(
     fun loadUrl(url: String) {
         if (!isDisposed) {
             logger.info("WebView loading URL: $url")
-            browser.loadURL(url)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable { browser.loadURL(url) }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
@@ -921,11 +931,15 @@ class WebViewInstance(
     fun loadHtml(html: String, baseUrl: String? = null) {
         if (!isDisposed) {
             logger.info("WebView loading HTML content, length: ${html.length}, baseUrl: $baseUrl")
-            if(baseUrl != null) {
-                browser.loadHTML(html, baseUrl)
-            }else {
-                browser.loadHTML(html)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable {
+                if(baseUrl != null) {
+                    browser.loadHTML(html, baseUrl)
+                } else {
+                    browser.loadHTML(html)
+                }
             }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
@@ -935,7 +949,9 @@ class WebViewInstance(
     fun executeJavaScript(script: String) {
         if (!isDisposed) {
             logger.debug("WebView executing JavaScript, script length: ${script.length}")
-            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+            val app = ApplicationManager.getApplication()
+            val runnable = Runnable { browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0) }
+            if (app.isDispatchThread) runnable.run() else app.invokeLater(runnable)
         }
     }
     
