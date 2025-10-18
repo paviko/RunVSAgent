@@ -111,6 +111,43 @@ parse_setup_args() {
     done
 }
 
+# Attempt to install Git LFS if missing
+install_git_lfs() {
+    if command_exists "git-lfs"; then
+        return 0
+    fi
+    if is_linux && command_exists "apt-get"; then
+        log_info "Attempting to install Git LFS via apt-get..."
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_debug "Would run: sudo apt-get update -y && sudo apt-get install -y git-lfs"
+        else
+            (sudo -n apt-get update -y >/dev/null 2>&1 || apt-get update -y >/dev/null 2>&1) || true
+            (sudo -n apt-get install -y git-lfs >/dev/null 2>&1 || apt-get install -y git-lfs >/dev/null 2>&1) || true
+        fi
+        command_exists "git-lfs" && return 0
+    fi
+    if is_macos && command_exists "brew"; then
+        log_info "Attempting to install Git LFS via Homebrew..."
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_debug "Would run: brew install git-lfs"
+        else
+            brew install git-lfs >/dev/null 2>&1 || true
+        fi
+        command_exists "git-lfs" && return 0
+    fi
+    if is_windows && command_exists "choco"; then
+        log_info "Attempting to install Git LFS via Chocolatey..."
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_debug "Would run: choco install git-lfs -y"
+        else
+            choco install git-lfs -y >/dev/null 2>&1 || true
+        fi
+        command_exists "git-lfs" && return 0
+    fi
+    log_warn "Automatic Git LFS installation not available or failed."
+    return 1
+}
+
 # Validate system requirements
 validate_system_requirements() {
     log_step "Validating system requirements..."
@@ -135,7 +172,12 @@ validate_system_requirements() {
     
     # Check for Git LFS
     if ! command_exists "git-lfs"; then
-        die "Git LFS not found. Please install Git LFS: https://git-lfs.github.io/" 2
+        log_warn "Git LFS not found."
+        if install_git_lfs; then
+            log_debug "Git LFS installed successfully"
+        else
+            die "Git LFS not found. Please install Git LFS: https://git-lfs.github.io/" 2
+        fi
     fi
     log_debug "Found Git LFS"
     
@@ -288,10 +330,32 @@ install_dependencies() {
             [[ -f "pnpm-lock.yaml" ]] && rm -f "pnpm-lock.yaml"
         fi
         
-        # Use pnpm if available and lock file exists
+        # Use pnpm if pnpm-lock exists; install pnpm if missing
         local pkg_manager="npm"
-        if command_exists "pnpm" && [[ -f "pnpm-lock.yaml" ]]; then
-            pkg_manager="pnpm"
+        if [[ -f "pnpm-lock.yaml" ]]; then
+            if command_exists "pnpm"; then
+                pkg_manager="pnpm"
+            else
+                log_warn "pnpm-lock.yaml detected but pnpm is not installed. Attempting to install pnpm globally..."
+                if command_exists "npm"; then
+                    # Try installing pnpm globally; do not abort if installation fails
+                    if [[ "$DRY_RUN" == "true" ]]; then
+                        log_debug "Would run: npm install -g pnpm"
+                    else
+                        npm install -g pnpm >/dev/null 2>&1 || true
+                    fi
+                    if command_exists "pnpm"; then
+                        log_success "pnpm installed successfully"
+                        pkg_manager="pnpm"
+                    else
+                        log_error "pnpm installation failed. Roo Code workspace requires pnpm to install dependencies."
+                        log_info "Please install pnpm manually: npm install -g pnpm"
+                        die "pnpm is required to install VSCode extension dependencies" 3
+                    fi
+                else
+                    die "npm is not available to install pnpm" 3
+                fi
+            fi
         fi
         
         execute_cmd "$pkg_manager install" "VSCode extension dependencies installation"
